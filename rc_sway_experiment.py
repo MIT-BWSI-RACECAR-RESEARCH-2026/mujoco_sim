@@ -67,28 +67,28 @@ import numpy as np
 XML_PATH = "rc-truck-trailer.xml"
 
 # ---------------- geometry knobs ----------------
-CARGO_OFFSET = 0.08      # m relative to axle (+ = ahead/stable, - = behind/sway)
-CARGO_MASS = 0.6         # kg
+CARGO_OFFSET = 0.09      # m relative to axle (+ = ahead/stable, - = behind/sway)
+CARGO_MASS = 3.5         # kg
 CARGO_HALF = (0.050, 0.048, 0.035)   # payload box half-sizes (fits the rails)
 
 TRAILER_TIRE_MU = 0.9
-HITCH_DAMPING = 0.005
+HITCH_DAMPING = 0.002
 
 # ---------------- aerodynamics ----------------
 # MuJoCo's built-in fluid model: every body gets quadratic drag + viscous
 # damping computed from its equivalent-inertia box, relative to WIND.
-AIR_DENSITY = 1.204      # kg/m^3 (sea-level air; set 0.0 for vacuum = no drag; set 1.204 for drag)
-AIR_VISCOSITY = 1.8e-5   # Pa*s   (air; set 0 for no damping; set 1.8e-5 for air damping)
+AIR_DENSITY = 0      # kg/m^3 (sea-level air; set 0.0 for vacuum = no drag; set 1.204 for drag)
+AIR_VISCOSITY = 0   # Pa*s   (air; set 0 for no damping; set 1.8e-5 for air damping)
 WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # a steady 2 m/s crosswind from the left - a
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 210.0        # rad/s wheel target (~4.0 m/s)
+SPEED_CTRL = 175.0        # rad/s wheel target (~4.0 m/s)
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
-DISTURB_START = 0.15     # first-run magnitude: rad (swerve) or N (gust)
+DISTURB_START = 0.05     # first-run magnitude: rad (swerve) or N (gust), default .15
 DISTURB_STEP = 0.00      # added to the magnitude after every run
 CARGO_OFFSET_STEP = -0.08  # m added to CARGO_OFFSET after every run
 CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
@@ -96,7 +96,7 @@ CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
 GUST_TIME = 0.5          # s
 SETTLE_TIME = 1.0        # s
 SPINUP_TIME = 5.0        # s
-MAX_RECORD = 15.0        # s
+MAX_RECORD = 25.0        # s
 REALTIME = True
 # ---------------------------------------------------
 
@@ -315,7 +315,7 @@ def build_model(cargo_offset, cargo_mass):
         xml = xml.replace("<actuator>", eq, 1)
         xml = xml.replace("</actuator>",
             '  <velocity name="leader_drive" joint="leader_x" kv="200" '
-            'ctrlrange="0 12"/>\n  </actuator>')
+            'ctrlrange="0 100"/>\n  </actuator>')
 
     if PLANAR_MODE:
         # car root: x / y / yaw only -> no heave, pitch, or roll anywhere
@@ -470,7 +470,7 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     steer, speed = control_function(
                         read_sensors(model, data), dt, ctrl_state)
                     steer = max(-MAX_STEER, min(MAX_STEER, steer))
-                    speed = max(0.0, min(220.0, speed))
+                    speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer
                     data.ctrl[dl] = speed

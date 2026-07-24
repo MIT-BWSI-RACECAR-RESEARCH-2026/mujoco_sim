@@ -38,7 +38,7 @@
        + viscous damping on every body, computed from its equivalent-inertia
        box, relative to the ambient "wind" vector. density=0 -> vacuum.
        The python script overrides these three attributes at build time. -->
-  <option timestep="0.0005" gravity="0 0 -9.81" integrator="implicitfast"
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast"
           density="1.204" viscosity="1.8e-5" wind="0 0 0"/>
   <visual><global offwidth="1920" offheight="1080"/></visual>
 
@@ -62,7 +62,7 @@
   </asset>
 
   <default>
-    <geom condim="3" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
+    <geom condim="6" friction="1.2 0.005 0.0001" contype="1" conaffinity="1"/>
     <default class="visual">
       <geom contype="0" conaffinity="0" mass="0" group="2"/>
     </default>
@@ -88,7 +88,7 @@
     <body name="car" pos="0 0 0.0531">
       <freejoint name="car_root"/>
     <!-- CAR_ROOT_END -->
-      <inertial pos="0 0 0.02" mass="5.0" diaginertia="0.040 0.075 0.092"/>
+      <inertial pos="0 0 0.02" mass="2.5" diaginertia="0.040 0.075 0.092"/>
       <geom name="car_frame_vis" class="visual" type="mesh" mesh="car_frame" material="car_mat"/>
       <!-- chassis collision (approx CAD envelope) -->
       <geom name="car_chassis_col" type="box" size="0.190 0.095 0.030" pos="0 0 0.025" mass="0" group="3"/>
@@ -174,8 +174,8 @@
   </worldbody>
 
   <actuator>
-    <velocity name="drive_left"  joint="rl_hinge" kv="2.0" ctrlrange="0 220"/>
-    <velocity name="drive_right" joint="rr_hinge" kv="2.0" ctrlrange="0 220"/>
+    <velocity name="drive_left"  joint="rl_hinge" kv="2.0" ctrlrange="0 300"/>
+    <velocity name="drive_right" joint="rr_hinge" kv="2.0" ctrlrange="0 300"/>
     <position name="steer_left"  joint="fl_steer" kp="15" kv="0.8" ctrlrange="-0.61 0.61"/>
     <position name="steer_right" joint="fr_steer" kp="15" kv="0.8" ctrlrange="-0.61 0.61"/>
   </actuator>
