@@ -77,18 +77,18 @@ HITCH_DAMPING = 0.002
 # ---------------- aerodynamics ----------------
 # MuJoCo's built-in fluid model: every body gets quadratic drag + viscous
 # damping computed from its equivalent-inertia box, relative to WIND.
-AIR_DENSITY = 0      # kg/m^3 (sea-level air; set 0.0 for vacuum = no drag; set 1.204 for drag)
-AIR_VISCOSITY = 0   # Pa*s   (air; set 0 for no damping; set 1.8e-5 for air damping)
+AIR_DENSITY = 1.204      # kg/m^3 (sea-level air; set 0.0 for vacuum = no drag; set 1.204 for drag)
+AIR_VISCOSITY = 1.8e-5   # Pa*s   (air; set 0 for no damping; set 1.8e-5 for air damping)
 WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # a steady 2 m/s crosswind from the left - a
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 175.0        # rad/s wheel target (~4.0 m/s)
+SPEED_CTRL = 160.0        # rad/s wheel target (~4.0 m/s)
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
-DISTURB_START = 0.05     # first-run magnitude: rad (swerve) or N (gust), default .15
+DISTURB_START = 0.15     # first-run magnitude: rad (swerve) or N (gust), default .15
 DISTURB_STEP = 0.00      # added to the magnitude after every run
 CARGO_OFFSET_STEP = -0.08  # m added to CARGO_OFFSET after every run
 CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
@@ -96,12 +96,12 @@ CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
 GUST_TIME = 0.5          # s
 SETTLE_TIME = 1.0        # s
 SPINUP_TIME = 5.0        # s
-MAX_RECORD = 25.0        # s
+MAX_RECORD = 15.0        # s
 REALTIME = True
 # ---------------------------------------------------
 
 # fixed trailer constants (from the CAD / rc-truck-trailer.xml)
-FRAME_MASS = 0.8         # kg, trailer frame (explicit inertial in the XML)
+FRAME_MASS = 0.8         # kg, trailer frame (explicit inertial in the XML) TODO change to 1 to make more accurate
 FRAME_COM_X = -0.24      # m, frame COM behind the hitch
 TRAILER_WHEEL_MASS = 0.05
 HITCH_TO_AXLE = 0.2475   # m, hitch pivot -> axle line (FIXED by the CAD)
@@ -198,6 +198,13 @@ def control_function(sensors, dt, state):
 # >>> END CONTROLLER <<<
 # =====================================================================
 
+def parallel_axis(I_own, m, com, target_com):
+    d = com - target_com
+    return I_own + m * np.array([
+        d[1] ** 2 + d[2] ** 2,
+        d[0] ** 2 + d[2] ** 2,
+        d[0] ** 2 + d[1] ** 2,
+    ])
 
 def trailer_xml(cargo_offset, cargo_mass):
     """Generate the CAD-trailer subtree for the given payload placement."""
@@ -222,6 +229,23 @@ def trailer_xml(cargo_offset, cargo_mass):
     print(f"Static tongue load = {1000 * tongue_load / G:.0f} g "
           f"({100 * tongue_load / (G * total):.0f}% of trailer weight)"
           + ("  << NEGATIVE: sway-prone!" if tongue_load < 0 else ""))
+    # ---- combined frame+cargo inertial (parallel-axis theorem) ----
+    frame_com = np.array([FRAME_COM_X, 0.0, -0.045])
+    frame_I = np.array([0.0035, 0.012, 0.014])
+
+    cargo_com = np.array([cx, 0.0, cz])
+    hx, hy, hz = CARGO_HALF
+    # solid-box inertia about its own COM
+    cargo_I_own = cargo_mass / 3.0 * np.array([
+        hy ** 2 + hz ** 2,
+        hx ** 2 + hz ** 2,
+        hx ** 2 + hy ** 2,
+    ])
+
+    body_mass = FRAME_MASS + cargo_mass
+    body_com = (FRAME_MASS * frame_com + cargo_mass * cargo_com) / body_mass
+    body_I = (parallel_axis(frame_I, FRAME_MASS, frame_com, body_com)
+          + parallel_axis(cargo_I_own, cargo_mass, cargo_com, body_com))
 
     if PLANAR_MODE:
         hitch = (f'<joint name="hitch" type="hinge" axis="0 0 1" '
@@ -244,13 +268,13 @@ def trailer_xml(cargo_offset, cargo_mass):
     return f"""<!-- TRAILER_START -->
       <body name="trailer" pos="-0.1857 0 0.065">
         {hitch}
-        <inertial pos="{FRAME_COM_X} 0 -0.045" mass="{FRAME_MASS}" diaginertia="0.0035 0.012 0.014"/>
+        <inertial pos="{body_com[0]:.5f} {body_com[1]:.5f} {body_com[2]:.5f}" mass="{body_mass:.5f}" diaginertia="{body_I[0]:.6f} {body_I[1]:.6f} {body_I[2]:.6f}"/>
         <site name="hitch_force_site" pos="0 0 0" size="0.008" rgba="0 0 1 0.5"/>
         <site name="imu_trailer" pos="-0.25 0 -0.03" size="0.008" rgba="1 0 0 0.5"/>
         <geom name="trailer_frame_vis" class="visual" type="mesh" mesh="trailer_frame" material="trailer_mat"/>
         <geom name="trailer_deck_col" type="box" size="0.155 0.100 0.0125" pos="-0.243 0 -0.0525" mass="0" group="3"/>
         <geom name="trailer_tongue_col" type="capsule" size="0.008" fromto="0.005 0 -0.005  -0.100 0 -0.050" mass="0" contype="0" conaffinity="0"/>
-        <geom name="cargo" type="box" size="{CARGO_HALF[0]} {CARGO_HALF[1]} {CARGO_HALF[2]}" pos="{cx:.4f} 0 {cz:.4f}" mass="{cargo_mass}" material="payload_mat"/>
+        <geom name="cargo" type="box" size="{CARGO_HALF[0]} {CARGO_HALF[1]} {CARGO_HALF[2]}" pos="{cx:.4f} 0 {cz:.4f}" mass="0" material="payload_mat"/>
         <body name="tl_wheel" pos="{ax:.4f} {TRAILER_TRACK_Y} {wheel_z:.4f}">
           <joint name="tl_hinge" class="spin"/>
           <inertial pos="0 0 0" mass="{TRAILER_WHEEL_MASS}" diaginertia="2.0e-5 3.4e-5 2.0e-5"/>
