@@ -66,6 +66,16 @@ import numpy as np
 
 XML_PATH = "rc-truck-trailer.xml"
 
+# ---------------- lidar knobs (RichBeam LakiBeam 1L specs) ----------------
+SIMULATE_LIDAR = True
+LIDAR_FOV_DEG = 270
+LIDAR_PTS_PER_DEG = 4        # matches the 0.25° angular resolution setting (1/0.25 = 4)
+LIDAR_MAX_RANGE = 20.0       # m — datasheet: >=40m @ 70% reflectivity, >=20m @ 10% (conservative/worst-case)
+LIDAR_RANGE_ACCURACY = 0.02  # m, +/-2cm range accuracy -> use as noise std dev
+LIDAR_SCAN_HZ = 20           # rotation frequency at 0.25 deg resolution (options: 20/25/30 Hz)
+
+
+
 # ---------------- geometry knobs ----------------
 CARGO_OFFSET = 0.09      # m relative to axle (+ = ahead/stable, - = behind/sway)
 CARGO_MASS = 3.5         # kg
@@ -382,6 +392,25 @@ def read_sensors(model, data):
     return out
 
 
+def simulate_lidar(model, data, site_id, exclude_body_id,
+                    fov_deg=LIDAR_FOV_DEG, pts_per_deg=LIDAR_PTS_PER_DEG,
+                    max_range=LIDAR_MAX_RANGE):
+    n_rays = int(fov_deg * pts_per_deg)
+    angles = np.linspace(-fov_deg / 2, fov_deg / 2, n_rays) * np.pi / 180
+
+    origin = data.site_xpos[site_id].copy()
+    xmat = data.site_xmat[site_id].reshape(3, 3)
+
+    ranges = np.full(n_rays, max_range)
+    geomid = np.zeros(1, dtype=np.int32)
+    for i, a in enumerate(angles):
+        direction = xmat @ np.array([np.cos(a), np.sin(a), 0.0])
+        dist = mujoco.mj_ray(model, data, origin, direction,
+                              None, 1, exclude_body_id, geomid)
+        if dist >= 0:
+            ranges[i] = min(dist, max_range)
+    return angles, ranges
+
 def tire_normal_loads(model, data, tire_ids, floor_id):
     """Total ground contact normal force per tire geom [N].
     Grip capacity is proportional to mu * normal load."""
@@ -421,6 +450,7 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     hitch_is_ball = int(hitch_joint.type[0]) == mujoco.mjtJoint.mjJNT_BALL
     hf_adr = model.sensor("hitch_force").adr[0]
     dt = model.opt.timestep
+    LIDAR_SAVE_EVERY  = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))  # ~50 steps at 20 Hz, dt=0.001
     trailer_rear_x = DECK_X_MIN            # gust acts on the trailer tail
 
     pv = None
@@ -433,6 +463,10 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
 
     tire_ids = {n: model.geom(n).id for n in TRUCK_TIRES + TRAILER_TIRES}
     floor_id = model.geom("floor").id
+
+    lidar_site_id = model.site("lidar_site").id
+    car_body_id = model.body("car").id
+    lidar_scans = []   # list of (time, angles, ranges)
 
     swerve_steps = int(0.4 / dt)
     if DISTURBANCE == "swerve":
@@ -521,6 +555,11 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
 
                 mujoco.mj_step(model, data)
 
+                if SIMULATE_LIDAR and phase == "record" and step_in_phase % LIDAR_SAVE_EVERY == 0:
+                    angles, ranges = simulate_lidar(model, data, lidar_site_id, car_body_id)
+                    lidar_scans.append((data.time, ranges))
+
+
                 if phase not in ("settle", "spinup"):
                     if hitch_is_ball:
                         q = data.qpos[hitch_adr:hitch_adr + 4]
@@ -595,6 +634,18 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     log["cargo_offset"] = cargo_offset
     log["cargo_mass"] = cargo_mass
     log["speed_ctrl"] = SPEED_CTRL
+
+
+    if SIMULATE_LIDAR and lidar_scans:
+        os.makedirs("lidar", exist_ok=True)
+        times = np.array([s[0] for s in lidar_scans])
+        scans = np.array([s[1] for s in lidar_scans])
+        np.savez(f"lidar/run{run_idx + 1}_{mode_tag()}_scans.npz",
+                times=times, scans=scans, fov_deg=LIDAR_FOV_DEG,
+                pts_per_deg=LIDAR_PTS_PER_DEG)
+        print(f"Lidar scans saved: {scans.shape[0]} scans, {scans.shape[1]} rays each")
+
+
     return log
 
 
