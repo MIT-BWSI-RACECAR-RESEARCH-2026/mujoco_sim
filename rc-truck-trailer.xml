@@ -96,6 +96,8 @@
       <site name="imu_car" pos="0 0 0.02" size="0.008" rgba="1 0 0 0.5"/>
       <site name="tow_eye" pos="0.1439 0 -0.0076" size="0.008" rgba="0 1 0 0.8"/>
 
+      <site name="lidar_site" pos="-0.0475 0 0.14" size="0.015 0.004" type="cylinder" rgba="0 1 1 1"/>
+
       <!-- front: steer knuckle + CAD wheel, rigid mount (no suspension) -->
       <body name="fl_knuckle" pos="0.1439 0.1095 -0.0076">
         <joint name="fl_steer" type="hinge" axis="0 0 1" range="-35 35" damping="0.05"/>
