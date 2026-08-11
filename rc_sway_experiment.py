@@ -84,7 +84,7 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 160.0        # rad/s wheel target (~4.0 m/s)
+SPEED_CTRL = 125.0        # rad/s wheel target (~4.0 m/s)
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
@@ -119,7 +119,7 @@ HITCH_HIT_MARGIN = 1.0   # deg, within this of the limit counts as contact
 FLIP_ROLL_DEG = 60.0     # deg of car roll that counts as flipped sideways
 
 # ---------------- pivot (towed oscillation) mode ----------------
-PIVOT_MODE = True        # True: controller OFF, car towed by a tow point
+PIVOT_MODE = False        # True: controller OFF, car towed by a tow point
 TOW_EYE = (0.1439, 0.0, -0.0076)   # car frame: center of the front axle
 CAR_Z0 = 0.0531          # car body height at qpos0 (from the XML)
 PIVOT_SPEED = SPEED_CTRL * WHEEL_RADIUS   # m/s tow speed (customizable)
@@ -158,42 +158,61 @@ Y_DEADBAND = 0.01        # m, offsets smaller than this are ignored
 # >>> CONTROLLER — EDIT THIS FUNCTION <<<
 # (unchanged — never called in PIVOT_MODE)
 # =====================================================================
+LQR_K = np.array([0.8742, 0.5])   # [y_error, heading_error] -> steering_angle
+# NOTE: this K was designed on a 2-state [lane offset, heading] model of the
+# CAR ONLY (BWSI racecar wall-following lab). It has no hitch/trailer term,
+# so it stabilizes the car's lane tracking but does NOT actively damp
+# trailer sway - it only helps indirectly, by keeping the tow vehicle's
+# path smoother and its steering less abrupt than the human-driver model.
+# If you want the controller to actually counter hitch oscillation, augment
+# the state with hitch angle (and ideally hitch rate) from sensors
+# ["hitch_quat"] and redesign K around a car+trailer model - see the
+# comment block below the function for a sketch of how to wire that in.
+
+
 def control_function(sensors, dt, state):
-    # heading from the car IMU
+    # heading from the car IMU (road runs along +x, so yaw IS heading error)
     w, x, y, z = sensors["car_quat"]
     yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    heading_error = (yaw + math.pi) % (2 * math.pi) - math.pi
 
     if "v_est" not in state:
         state["v_est"] = SPEED_CTRL * WHEEL_RADIUS   # speed at handoff
         state["y_est"] = 0.0
-        state["steer"] = 0.0
-        state["cmd_buf"] = []                        # reaction-delay queue
 
-    # dead-reckoned speed and lateral offset from lane center
+    # dead-reckoned speed and lateral offset from lane center.
+    # (This sim has no lidar/wall scan, so - like the baseline driver model -
+    # lateral position comes from integrating IMU-derived lateral velocity
+    # rather than from get_heading_position_wall().)
     state["v_est"] += float(sensors["car_accel"][0]) * dt
     state["y_est"] += state["v_est"] * math.sin(yaw) * dt
 
-    # driver ignores tiny offsets
-    y_err = state["y_est"] if abs(state["y_est"]) > Y_DEADBAND else 0.0
+    x_err = np.array([state["y_est"], heading_error])
+    steering_angle = -float(LQR_K @ x_err)
 
-    # aim at a point on the centerline, lookahead distance ahead
-    ld = max(LOOKAHEAD_MIN, state["v_est"] * LOOKAHEAD_TIME)
-    alpha = math.atan2(-y_err, ld) - yaw             # angle to preview point
-    target = math.atan2(2 * WHEELBASE * math.sin(alpha), ld)  # pure pursuit
-    target = max(-MAX_STEER, min(MAX_STEER, target))
+    # NOTE on sign: your racecar version fed y_error = (image_center_x -
+    # lane_center_x), i.e. positive when the car is right of lane center.
+    # Here state["y_est"] is world +y (positive = left of lane center), the
+    # opposite sign convention. If the car steers AWAY from center instead
+    # of toward it when you first run this, flip the sign on state["y_est"]
+    # here (or equivalently negate LQR_K[0]).
+    steer = max(-MAX_STEER, min(MAX_STEER, steering_angle))
 
-    # reaction delay: act on the command from REACTION_DELAY seconds ago
-    state["cmd_buf"].append(target)
-    n_delay = max(1, int(REACTION_DELAY / dt))
-    delayed = (state["cmd_buf"].pop(0)
-               if len(state["cmd_buf"]) > n_delay else 0.0)
+    return steer, SPEED_CTRL
 
-    # steering-rate limit: hands can only turn the wheel so fast
-    max_step = STEER_RATE_MAX * dt
-    delta = max(-max_step, min(max_step, delayed - state["steer"]))
-    state["steer"] += delta
-
-    return state["steer"], SPEED_CTRL
+# ---------------------------------------------------------------------
+# Sketch for adding sway damping on top of this (not wired in - you'd
+# need to design K3/K4 yourself, e.g. via LQR on a linearized car+trailer
+# bicycle-with-trailer model):
+#
+#   hw, hx, hy, hz = sensors["hitch_quat"]
+#   hitch_yaw = math.atan2(2*(hw*hz+hx*hy), 1-2*(hy*hy+hz*hz))
+#   hitch_rate = (hitch_yaw - state.get("prev_hitch_yaw", hitch_yaw)) / dt
+#   state["prev_hitch_yaw"] = hitch_yaw
+#   K_aug = np.array([0.8742, 0.5, K3, K4])   # you design K3, K4
+#   x_err = np.array([state["y_est"], heading_error, hitch_yaw, hitch_rate])
+#   steering_angle = -float(K_aug @ x_err)
+# ---------------------------------------------------------------------
 # =====================================================================
 # >>> END CONTROLLER <<<
 # =====================================================================
@@ -413,6 +432,8 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
 
     dl = model.actuator("drive_left").id
     dr = model.actuator("drive_right").id
+    dlf = model.actuator("drive_left_front").id
+    drf = model.actuator("drive_right_front").id
     sl = model.actuator("steer_left").id
     sr = model.actuator("steer_right").id
     trailer_id = model.body("trailer").id
@@ -427,7 +448,7 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     if PIVOT_MODE:
         pv = model.actuator("leader_drive").id
         # freewheel the drive wheels: the tow point pulls, not the wheels
-        for a in (dl, dr):
+        for a in (dl, dr, dlf, drf):
             model.actuator_gainprm[a, 0] = 0
             model.actuator_biasprm[a, 2] = 0
 
@@ -497,12 +518,16 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer
-                    data.ctrl[dl] = speed
-                    data.ctrl[dr] = speed
+                    data.ctrl[dl] = steer # was "speed"
+                    data.ctrl[dr] = steer # same
+                    data.ctrl[dlf] = speed
+                    data.ctrl[drf] = speed
                 else:
                     if phase != "settle":
-                        data.ctrl[dl] = SPEED_CTRL
-                        data.ctrl[dr] = SPEED_CTRL
+                        data.ctrl[dl] = SPEED_CTRL # was speed_ctrl
+                        data.ctrl[dr] = SPEED_CTRL # same
+                        data.ctrl[dlf] = SPEED_CTRL
+                        data.ctrl[drf] = SPEED_CTRL
                     steer = {"swerve_r": magnitude,
                              "swerve_l": -magnitude}.get(phase, 0.0)
                     data.ctrl[sl] = steer
