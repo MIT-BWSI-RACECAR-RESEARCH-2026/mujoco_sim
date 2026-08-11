@@ -12,9 +12,8 @@ rc-truck-trailer.xml (CAD meshes in ./assets).
 - IMUs on car and trailer (accel, gyro, orientation quat) + hitch sensor
   (trailer angle relative to car).
 - control_function() below is YOUR hook: it receives only the sensor data
-  and returns (steer, speed). Preloaded with a human-driver model
-  (preview steering, reaction delay, rate limit) that always corrects
-  toward the middle of the lane but is blind to the trailer.
+  and returns (steer, speed). Preloaded with a simple LQR lane-tracking
+  controller.
 
 MODES
 - PIVOT_MODE: controller OFF. A single massless "tow point" is attached to
@@ -94,7 +93,10 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 125.0        # rad/s wheel target (~4.0 m/s)
+SPEED_CTRL = 125.0        # rad/s wheel target (FIX #2: this is ~5.7 m/s at
+                          # WHEEL_RADIUS=0.0455 m, not "~4.0 m/s" as the
+                          # original comment claimed — change to ~88 if you
+                          # actually want 4.0 m/s)
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
@@ -155,13 +157,20 @@ SENSOR_NAMES = {
     "hitch_quat": "hitch_angle",
 }
 
-# ---------------- human driver parameters ----------------
-WHEELBASE = 0.288        # m, car wheelbase (pure-pursuit geometry)
-LOOKAHEAD_TIME = 0.8     # s, how far down the road the driver looks
-LOOKAHEAD_MIN = 0.6      # m, minimum preview distance at low speed
-REACTION_DELAY = 0.25    # s, perception + neuromuscular delay
-STEER_RATE_MAX = 6.0     # rad/s max front-wheel rate (RC servo limit)
-Y_DEADBAND = 0.01        # m, offsets smaller than this are ignored
+# ---------------- driver-model parameters ----------------
+# NOTE on driver realism (FIX #5): these six constants (WHEELBASE through
+# Y_DEADBAND) describe a preview-steering / reaction-delay / rate-limited
+# driver model, but control_function() below does NOT use any of them —
+# it's a plain instantaneous 2-state LQR. They're left here in case you
+# want to wire them in, but as written the controller has zero reaction
+# delay, no steering-rate limit, and no deadband. Don't describe results
+# from this controller as including those effects.
+WHEELBASE = 0.288        # m, car wheelbase (pure-pursuit geometry) — UNUSED
+LOOKAHEAD_TIME = 0.8     # s, how far down the road the driver looks — UNUSED
+LOOKAHEAD_MIN = 0.6      # m, minimum preview distance at low speed — UNUSED
+REACTION_DELAY = 0.25    # s, perception + neuromuscular delay — UNUSED
+STEER_RATE_MAX = 6.0     # rad/s max front-wheel rate (RC servo limit) — UNUSED
+Y_DEADBAND = 0.01        # m, offsets smaller than this are ignored — UNUSED
 
 
 # =====================================================================
@@ -326,19 +335,26 @@ def build_model(cargo_offset, cargo_mass):
 
     # aerodynamics: override the fluid attributes on the <option> tag with
     # the knobs above (works regardless of the values written in the XML)
-    xml = re.sub(r'density="[^"]*"', f'density="{AIR_DENSITY}"', xml, count=1)
-    xml = re.sub(r'viscosity="[^"]*"',
-                 f'viscosity="{AIR_VISCOSITY}"', xml, count=1)
-    xml = re.sub(r'wind="[^"]*"',
-                 f'wind="{WIND[0]} {WIND[1]} {WIND[2]}"', xml, count=1)
+    # FIX #3: assert a substitution actually happened instead of silently
+    # leaving the XML's original value in place if the attribute pattern
+    # ever stops matching.
+    xml, n = re.subn(r'density="[^"]*"', f'density="{AIR_DENSITY}"', xml, count=1)
+    assert n == 1, "density=\"...\" attribute not found on <option> tag"
+    xml, n = re.subn(r'viscosity="[^"]*"', f'viscosity="{AIR_VISCOSITY}"', xml, count=1)
+    assert n == 1, "viscosity=\"...\" attribute not found on <option> tag"
+    xml, n = re.subn(r'wind="[^"]*"',
+                      f'wind="{WIND[0]} {WIND[1]} {WIND[2]}"', xml, count=1)
+    assert n == 1, "wind=\"...\" attribute not found on <option> tag"
 
     # from_xml_string resolves meshdir against the CWD, not the XML file:
     # make it absolute so the script works from anywhere
     assets_abs = os.path.join(
         os.path.dirname(os.path.abspath(XML_PATH)), "assets")
+    assert 'meshdir="assets"' in xml, "meshdir=\"assets\" not found in XML"
     xml = xml.replace('meshdir="assets"', f'meshdir="{assets_abs}"')
 
     # force sensor at the hitch: lateral force the trailer puts on the car
+    assert "</sensor>" in xml, "</sensor> closing tag not found in XML"
     xml = xml.replace(
         "</sensor>",
         '  <force name="hitch_force" site="hitch_force_site"/>\n  </sensor>')
@@ -357,6 +373,7 @@ def build_model(cargo_offset, cargo_mass):
             contype="0" conaffinity="0" rgba="0 1 0 0.8"/>
     </body>
     <!-- CAR_ROOT_START -->"""
+        assert "<!-- CAR_ROOT_START -->" in xml, "CAR_ROOT_START marker not found in XML"
         xml = xml.replace("<!-- CAR_ROOT_START -->", leader, 1)
 
         # ball-type attachment: tow point and front-axle center coincide,
@@ -365,13 +382,17 @@ def build_model(cargo_offset, cargo_mass):
     <connect name="tow_ball" body1="leader" body2="car" anchor="0 0 0"/>
   </equality>
   <actuator>"""
+        assert "<actuator>" in xml, "<actuator> tag not found in XML"
         xml = xml.replace("<actuator>", eq, 1)
+        assert "</actuator>" in xml, "</actuator> tag not found in XML"
         xml = xml.replace("</actuator>",
             '  <velocity name="leader_drive" joint="leader_x" kv="200" '
             'ctrlrange="0 100"/>\n  </actuator>')
 
     if PLANAR_MODE:
         # car root: x / y / yaw only -> no heave, pitch, or roll anywhere
+        assert "<!-- CAR_ROOT_START -->" in xml, "CAR_ROOT_START marker not found in XML"
+        assert "<!-- CAR_ROOT_END -->" in xml, "CAR_ROOT_END marker not found in XML"
         rs = xml.index("<!-- CAR_ROOT_START -->")
         re_ = xml.index("<!-- CAR_ROOT_END -->") + len("<!-- CAR_ROOT_END -->")
         planar_root = f"""<body name="car" pos="0 0 {CAR_Z0}">
@@ -380,12 +401,19 @@ def build_model(cargo_offset, cargo_mass):
       <joint name="car_yaw" type="hinge" axis="0 0 1"/>"""
         xml = xml[:rs] + planar_root + xml[re_:]
         # hitch is a hinge in planar mode: swap the ball sensor for jointpos
+        assert '<ballquat name="hitch_angle" joint="hitch"/>' in xml, \
+            "ballquat hitch_angle sensor not found in XML"
         xml = xml.replace('<ballquat name="hitch_angle" joint="hitch"/>',
                           '<jointpos name="hitch_angle" joint="hitch"/>')
         # one common friction coefficient on every tire: this string lives
         # in the "tire" default class in the XML, so one replace covers all
         # four car tires (the trailer tires already got PLANAR_TIRE_MU
         # explicitly in trailer_xml)
+        # FIX #3: assert this actually matched instead of silently no-op'ing
+        # if the XML's default tire friction string ever changes.
+        assert 'friction="1.3 0.005 0.0001"' in xml, (
+            'default tire friction="1.3 0.005 0.0001" not found in XML — '
+            'PLANAR_TIRE_MU would silently NOT be applied to the car tires')
         xml = xml.replace('friction="1.3 0.005 0.0001"',
                           f'friction="{PLANAR_TIRE_MU} 0.005 0.0001"')
         # NOTE: unlike the full-size model, the car COM is already centered
@@ -546,20 +574,32 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     data.ctrl[sr] = steer
                 elif phase == "record":
                     # ---- your controller drives steering AND speed ----
+                    # FIX #1: dl/dr were previously fed `steer` (a leftover
+                    # from an edit — see original's "# was speed" comments).
+                    # All four drive actuators now correctly get `speed`,
+                    # matching the non-controller "drive" phase below.
+                    # FIX #4: removed the redundant second steer-clamp here
+                    # (control_function already clamps to MAX_STEER).
                     steer, speed = control_function(
                         read_sensors(model, data), dt, ctrl_state)
-                    steer = max(-MAX_STEER, min(MAX_STEER, steer))
                     speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer
-                    data.ctrl[dl] = steer # was "speed"
-                    data.ctrl[dr] = steer # same
+                    data.ctrl[dl] = speed
+                    data.ctrl[dr] = speed
                     data.ctrl[dlf] = speed
                     data.ctrl[drf] = speed
                 else:
-                    if phase != "settle":
-                        data.ctrl[dl] = SPEED_CTRL # was speed_ctrl
-                        data.ctrl[dr] = SPEED_CTRL # same
+                    if phase == "spinup":
+                        ramp = min(1.0, step_in_phase / schedule[phase_idx][1])
+                        target = ramp * SPEED_CTRL
+                        data.ctrl[dl] = target
+                        data.ctrl[dr] = target
+                        data.ctrl[dlf] = target
+                        data.ctrl[drf] = target
+                    elif phase != "settle":
+                        data.ctrl[dl] = SPEED_CTRL
+                        data.ctrl[dr] = SPEED_CTRL
                         data.ctrl[dlf] = SPEED_CTRL
                         data.ctrl[drf] = SPEED_CTRL
                     steer = {"swerve_r": magnitude,
