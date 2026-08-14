@@ -76,7 +76,7 @@ LIDAR_SCAN_HZ = 20           # rotation frequency at 0.25 deg resolution (option
 
 
 # ---------------- geometry knobs ----------------
-CARGO_OFFSET = 0.09      # m relative to axle (+ = ahead/stable, - = behind/sway)
+CARGO_OFFSET = 0.08      # m relative to axle (+ = ahead/stable, - = behind/sway)
 CARGO_MASS = 3.5         # kg
 CARGO_HALF = (0.050, 0.048, 0.035)   # payload box half-sizes (fits the rails)
 
@@ -93,7 +93,7 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 125.0        # rad/s wheel target (FIX #2: this is ~5.7 m/s at
+SPEED_CTRL = 160.0        # rad/s wheel target (FIX #2: this is ~5.7 m/s at
                           # WHEEL_RADIUS=0.0455 m, not "~4.0 m/s" as the
                           # original comment claimed — change to ~88 if you
                           # actually want 4.0 m/s)
@@ -189,35 +189,94 @@ LQR_K = np.array([0.8742, 0.5])   # [y_error, heading_error] -> steering_angle
 # comment block below the function for a sketch of how to wire that in.
 
 
-def control_function(sensors, dt, state):
-    # heading from the car IMU (road runs along +x, so yaw IS heading error)
-    w, x, y, z = sensors["car_quat"]
-    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-    heading_error = (yaw + math.pi) % (2 * math.pi) - math.pi
+def get_wall_line(ranges, angles, start_idx, end_idx):
+    """Fits a line y = m*x + b to a slice of LiDAR ranges in local frame."""
+    r = ranges[start_idx:end_idx]
+    a = angles[start_idx:end_idx]
+    
+    # Filter out max-range/invalid hits
+    valid = r < (LIDAR_MAX_RANGE - 0.5)
+    if np.sum(valid) < 5:
+        return None
+        
+    x = r[valid] * np.cos(a[valid])  # forward distance
+    y = r[valid] * np.sin(a[valid])  # lateral distance
+    
+    # Fit line: y = m*x + b (m = slope/heading, b = lateral offset at car position)
+    m, b = np.polyfit(x, y, 1)
+    return m, b
 
-    if "v_est" not in state:
-        state["v_est"] = SPEED_CTRL * WHEEL_RADIUS   # speed at handoff
-        state["y_est"] = 0.0
+def get_heading_position_wall(ranges, angles):
+    """Returns heading error (rad) and lateral position offset (m) relative to track center."""
+    # Rays: 1080 total points across -135° to +135° (index 540 = 0° forward)
+    # Right side: -100° to -20° (indices ~140 to 460)
+    # Left side:   +20° to +100° (indices ~620 to 940)
+    right_line = get_wall_line(ranges, angles, 140, 460)
+    left_line  = get_wall_line(ranges, angles, 620, 940)
 
-    # dead-reckoned speed and lateral offset from lane center.
-    # (This sim has no lidar/wall scan, so - like the baseline driver model -
-    # lateral position comes from integrating IMU-derived lateral velocity
-    # rather than from get_heading_position_wall().)
-    state["v_est"] += float(sensors["car_accel"][0]) * dt
-    state["y_est"] += state["v_est"] * math.sin(yaw) * dt
+    if right_line is None or left_line is None:
+        return 0.0, 0.0  # Fallback if walls are lost
 
-    x_err = np.array([state["y_est"], heading_error])
-    steering_angle = -float(LQR_K @ x_err)
+    m_right, b_right = right_line
+    m_left,  b_left  = left_line
 
-    # NOTE on sign: your racecar version fed y_error = (image_center_x -
-    # lane_center_x), i.e. positive when the car is right of lane center.
-    # Here state["y_est"] is world +y (positive = left of lane center), the
-    # opposite sign convention. If the car steers AWAY from center instead
-    # of toward it when you first run this, flip the sign on state["y_est"]
-    # here (or equivalently negate LQR_K[0]).
-    steer = max(-MAX_STEER, min(MAX_STEER, steering_angle))
+    # Heading error is the average angle of the walls
+    heading_error = math.atan((m_right + m_left) / 2.0)
 
-    return steer, SPEED_CTRL
+    # Track center offset: average of left wall (+) and right wall (-) offsets
+    y_error = (b_left + b_right) / 2.0  
+
+    return heading_error, y_error
+
+def control_function(sensors, dt, state, model=None, data=None, site_id=None, car_id=None):
+    # 1. Initialize state variables on the first run
+    if "step_count" not in state:
+        state["step_count"] = 0
+        state["last_steer"] = 0.0
+        state["last_speed"] = SPEED_CTRL
+        
+        # Calculate how many 0.001s steps make up one 20Hz LiDAR scan (should be 50)
+        state["lidar_interval"] = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))
+
+    # 2. Only run the expensive LiDAR scan at 20Hz
+    if state["step_count"] % state["lidar_interval"] == 0:
+        if model is not None and data is not None:
+            # Get real-time LiDAR scan
+            angles, ranges = simulate_lidar(model, data, site_id, car_id)
+            # Extract errors from real LiDAR scan
+            heading_err, y_err = get_heading_position_wall(ranges, angles)
+            
+            # Print debugs here so they only print at 20Hz, not 1000Hz
+            left_avg = np.mean(ranges[160:200])
+            right_avg = np.mean(ranges[880:920])
+            print(f"Controller -> left avg: {left_avg:.3f}, right avg: {right_avg:.3f}")
+        else:
+            # Fallback to IMU dead reckoning
+            print("dead reckoning fallback!!!!!")
+            w, x, y, z = sensors["car_quat"]
+            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+            heading_err = (yaw + math.pi) % (2 * math.pi) - math.pi
+            
+            # Initialize v_est and y_est if falling back to IMU
+            if "v_est" not in state:
+                state["v_est"] = 0.0
+                state["y_est"] = 0.0
+                
+            state["v_est"] += float(sensors["car_accel"][0]) * dt
+            state["y_est"] += state["v_est"] * math.sin(yaw) * dt
+            y_err = state["y_est"]
+
+        # 3. LQR Control step
+        x_err = np.array([y_err, heading_err])
+        steering_angle = -float(LQR_K @ x_err)
+        steer = max(-MAX_STEER, min(MAX_STEER, steering_angle))
+        
+        # Save the new steering command
+        state["last_steer"] = steer
+
+    # 4. Increment counter and return the held state
+    state["step_count"] += 1
+    return state["last_steer"], state["last_speed"]
 
 # ---------------------------------------------------------------------
 # Sketch for adding sway damping on top of this (not wired in - you'd
@@ -485,6 +544,9 @@ def mode_tag():
 
 def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     model = build_model(cargo_offset, cargo_mass)
+    # fix the clipping making it impossible to view
+    model.stat.extent = 5.0
+    model.vis.map.znear = 0.01
     data = mujoco.MjData(model)
 
     dl = model.actuator("drive_left").id
@@ -558,10 +620,19 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
             phase_idx, step_in_phase = 0, 0
             viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             viewer.cam.trackbodyid = model.body("car").id
-            viewer.cam.distance = 2.5
+            viewer.cam.azimuth = 0
+            viewer.cam.distance = 4.0
+            viewer.cam.elevation = -25
             while viewer.is_running() and phase_idx < len(schedule):
                 step_start = time.time()
                 phase = schedule[phase_idx][0]
+                # --- ADDED: Print LiDAR during pre-record phases ---
+                if phase in ["settle", "spinup"] and step_in_phase % 500 == 0:
+                    angles, ranges = simulate_lidar(model, data, lidar_site_id, car_body_id)
+                    left_avg = np.mean(ranges[160:200])
+                    right_avg = np.mean(ranges[880:920])
+                    print(f"[{phase.upper()} Phase] left average: {left_avg:.3f}, right average: {right_avg:.3f}")
+                # ---------------------------------------------------
 
                 if PIVOT_MODE:
                     # controller OFF; the tow point pulls the car forward,
@@ -581,7 +652,13 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     # FIX #4: removed the redundant second steer-clamp here
                     # (control_function already clamps to MAX_STEER).
                     steer, speed = control_function(
-                        read_sensors(model, data), dt, ctrl_state)
+                        read_sensors(model, data), 
+                        dt, 
+                        ctrl_state, 
+                        model=model, 
+                        data=data, 
+                        site_id=lidar_site_id, 
+                        car_id=car_body_id)
                     speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer

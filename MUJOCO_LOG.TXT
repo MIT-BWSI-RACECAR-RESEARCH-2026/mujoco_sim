@@ -4,3 +4,5 @@ ERROR mjv_updateCamera (engine_vis_visualize.c:2959) Thu Jul 23 17:02:24 2026: t
 
 ERROR mjv_updateCamera (engine_vis_visualize.c:2959) Fri Jul 24 15:36:19 2026: track body id is outside valid range
 
+ERROR mjv_updateCamera (engine_vis_visualize.c:3019) Thu Aug 13 12:33:11 2026: track body id is outside valid range
+
