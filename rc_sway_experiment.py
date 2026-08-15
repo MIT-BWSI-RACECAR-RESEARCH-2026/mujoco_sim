@@ -177,6 +177,7 @@ Y_DEADBAND = 0.01        # m, offsets smaller than this are ignored — UNUSED
 # >>> CONTROLLER — EDIT THIS FUNCTION <<<
 # (unchanged — never called in PIVOT_MODE)
 # =====================================================================
+# original value: .8742, .5
 LQR_K = np.array([0.8742, 0.5])   # [y_error, heading_error] -> steering_angle
 # NOTE: this K was designed on a 2-state [lane offset, heading] model of the
 # CAR ONLY (BWSI racecar wall-following lab). It has no hitch/trailer term,
@@ -225,8 +226,8 @@ def get_heading_position_wall(ranges, angles):
 
     # Track center offset: average of left wall (+) and right wall (-) offsets
     y_error = (b_left + b_right) / 2.0  
-
-    return heading_error, y_error
+    print("b: ", y_error, "m: ", -heading_error, "control signal: ", -float(LQR_K @ np.array([y_error, heading_error])))
+    return -heading_error, y_error
 
 def control_function(sensors, dt, state, model=None, data=None, site_id=None, car_id=None):
     # 1. Initialize state variables on the first run
@@ -249,7 +250,7 @@ def control_function(sensors, dt, state, model=None, data=None, site_id=None, ca
             # Print debugs here so they only print at 20Hz, not 1000Hz
             left_avg = np.mean(ranges[160:200])
             right_avg = np.mean(ranges[880:920])
-            print(f"Controller -> left avg: {left_avg:.3f}, right avg: {right_avg:.3f}")
+            # print(f"Controller -> left avg: {left_avg:.3f}, right avg: {right_avg:.3f}")
         else:
             # Fallback to IMU dead reckoning
             print("dead reckoning fallback!!!!!")
@@ -276,6 +277,8 @@ def control_function(sensors, dt, state, model=None, data=None, site_id=None, ca
 
     # 4. Increment counter and return the held state
     state["step_count"] += 1
+    #print(f"steer: {state['last_steer']:.3f}, speed: {state['last_speed']:.3f}")
+    #.61 is all the way left, -.61 is all the way right, 0 is straight
     return state["last_steer"], state["last_speed"]
 
 # ---------------------------------------------------------------------
