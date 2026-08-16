@@ -111,7 +111,7 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
 # grip-limited steer angle is 0.159 rad; at the old 160 rad/s (7.28 m/s) it
 # was 0.048 rad, so the 0.15 rad swerve below demanded 2.8 g and spun the
 # car into the wall before the controller ever engaged.
-SPEED_CTRL = 88.0
+SPEED_CTRL = 59.0        # 59 (2.68 m/s) causes swerving
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
@@ -129,7 +129,7 @@ CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
 GUST_TIME = 0.5          # s
 SETTLE_TIME = 1.0        # s
 SPINUP_TIME = 5.0        # s
-MAX_RECORD = 30.0        # s
+MAX_RECORD = 15.0        # s
 REALTIME = True
 # ---------------------------------------------------
 
@@ -152,10 +152,13 @@ HITCH_HIT_MARGIN = 1.0   # deg, within this of the limit counts as contact
 FLIP_ROLL_DEG = 60.0     # deg of car roll that counts as flipped sideways
 
 # ------------------------MODE SETTINGS---------------------------
-PD_WALL_FOLLOW_MODE = True  # True: PD wall following controller, False: LQR controller
+FAST_MODE = True          # True: runs only 1 run with trailer at rearmost position (-.04 m), mass & other steps run at first step
+PD_WALL_FOLLOW_MODE = False  # True: PD wall following controller, False: LQR controller
 PIVOT_MODE = False        # True: controller OFF, car towed by a tow point. OVERRIDES PD MODE AND LQR MODE
 PLANAR_MODE = False      # True: no vertical-axis motion at all. No fore/aft
 
+# ----------------------- Fast mode settings -----------------------
+FAST_MODE_CARGO_OFFSET = -0.04  # m, cargo offset for FAST_MODE run
 
 # ---------------- pivot (towed oscillation) mode ----------------
 TOW_EYE = (0.1439, 0.0, -0.0076)   # car frame: center of the front axle
@@ -1026,12 +1029,20 @@ def plot_results(runs):
 
 if __name__ == "__main__":
     results = []
-    for i in range(N_RUNS):
-        mag = DISTURB_START + i * DISTURB_STEP
-        off = CARGO_OFFSET + i * CARGO_OFFSET_STEP
-        mass = CARGO_MASS + i * CARGO_MASS_STEP
-        print(f"\n=== Run {i + 1}/{N_RUNS} — {DISTURBANCE} mag {mag:g}, "
-              f"cargo {mass:g} kg @ {off:+.3f} m ===")
-        results.append(run_simulation(mag, off, mass, i))
-        time.sleep(.5)
+    if FAST_MODE:
+        mag = DISTURB_START
+        off = FAST_MODE_CARGO_OFFSET
+        mass = CARGO_MASS
+        print(f"\n=== Single run — {DISTURBANCE} mag {mag:g}, "
+                      f"cargo {mass:g} kg @ {off:+.3f} m ===")
+        results.append(run_simulation(mag, off, mass, 0))
+    else:
+        for i in range(N_RUNS):
+            mag = DISTURB_START + i * DISTURB_STEP
+            off = CARGO_OFFSET + i * CARGO_OFFSET_STEP
+            mass = CARGO_MASS + i * CARGO_MASS_STEP
+            print(f"\n=== Run {i + 1}/{N_RUNS} — {DISTURBANCE} mag {mag:g}, "
+                f"cargo {mass:g} kg @ {off:+.3f} m ===")
+            results.append(run_simulation(mag, off, mass, i))
+            time.sleep(.5)
     plot_results(results)
