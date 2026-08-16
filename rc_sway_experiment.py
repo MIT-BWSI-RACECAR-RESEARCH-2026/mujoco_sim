@@ -1,9 +1,10 @@
 """
-RC car + CAD trailer sway experiment (no suspension).
+RC car + CAD trailer sway experiment.
 RC-SCALE port of the full-size block-truck script, for use with
 rc-truck-trailer.xml (CAD meshes in ./assets).
 
 - Lane: 0.60 m wide, centered on y=0, road runs along +x. Lane center = y=0.
+  Walls at y = +-0.95 bound the corridor; the LiDAR follows those walls.
 - AIR RESISTANCE: MuJoCo's fluid model is enabled (AIR_DENSITY /
   AIR_VISCOSITY knobs). Every body feels quadratic drag + viscous damping
   based on its equivalent-inertia box, measured relative to the ambient
@@ -11,9 +12,13 @@ rc-truck-trailer.xml (CAD meshes in ./assets).
   the impulsive swerve/gust disturbances. AIR_DENSITY=0 restores vacuum.
 - IMUs on car and trailer (accel, gyro, orientation quat) + hitch sensor
   (trailer angle relative to car).
-- control_function() below is YOUR hook: it receives only the sensor data
-  and returns (steer, speed). Preloaded with a simple LQR lane-tracking
-  controller.
+- control_function() below is YOUR hook: it gets the sensor readings (plus
+  the model/data handles the simulated LiDAR needs) and returns
+  (steer, speed). Preloaded with two LQR controllers, selected by
+  CONTROLLER_MODE: a 2-state car-only lane tracker, and a 6-state
+  car+trailer controller that also damps hitch articulation. The 6-state
+  gain is solved at import time from trailer_model.py, so it always
+  matches the geometry and cruise speed configured here.
 
 MODES
 - PIVOT_MODE: controller OFF. A single massless "tow point" is attached to
@@ -46,6 +51,10 @@ TRAILER GEOMETRY NOTE
   box on the deck: CARGO_OFFSET is measured from the AXLE
   (+ = ahead of axle / stable, - = behind axle / sway-prone) and may
   range over roughly -0.10 .. +0.11 m (payload must stay on the deck).
+  Useful range is narrower than that: past about -0.06 m the negative
+  tongue load levers the car's REAR AXLE off the ground entirely, and no
+  steering controller can recover a car with no rear traction. build_model
+  prints the rear axle load per run and warns when it gets that low.
 """
 
 import csv
@@ -61,6 +70,8 @@ import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
 import numpy as np
+
+import trailer_model
 
 
 XML_PATH = "rc-truck-trailer.xml"
@@ -93,16 +104,26 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
                          # continuous alternative to the impulsive "gust"
 
 # ---------------- experiment knobs ----------------
-SPEED_CTRL = 160.0        # rad/s wheel target (FIX #2: this is ~5.7 m/s at
-                          # WHEEL_RADIUS=0.0455 m, not "~4.0 m/s" as the
-                          # original comment claimed — change to ~88 if you
-                          # actually want 4.0 m/s)
+# rad/s wheel target; cruise speed is SPEED_CTRL * WHEEL_RADIUS.
+# 88 rad/s -> 4.0 m/s. Keep this in step with DISTURB_START: a step steer
+# of delta rad pulls V^2 * delta / WHEELBASE of lateral acceleration, and
+# the tires can only supply TRAILER_TIRE_MU * g ~ 8.8 m/s^2. At 4.0 m/s the
+# grip-limited steer angle is 0.159 rad; at the old 160 rad/s (7.28 m/s) it
+# was 0.048 rad, so the 0.15 rad swerve below demanded 2.8 g and spun the
+# car into the wall before the controller ever engaged.
+SPEED_CTRL = 88.0
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
-DISTURB_START = 0.15     # first-run magnitude: rad (swerve) or N (gust), default .15
+DISTURB_START = 0.10     # first-run magnitude: rad (swerve) or N (gust)
 DISTURB_STEP = 0.00      # added to the magnitude after every run
-CARGO_OFFSET_STEP = -0.08  # m added to CARGO_OFFSET after every run
+# m added to CARGO_OFFSET after every run. -0.06 sweeps +0.08 -> +0.02 ->
+# -0.04, i.e. from a solidly nose-heavy trailer through neutral tongue
+# load to a negative one (sway-prone) while the car's rear tires still
+# carry load. Anything past about -0.06 lifts the car's rear axle clean
+# off the ground, which no steering controller can recover from - the
+# per-run printout below warns when a loading gets that far.
+CARGO_OFFSET_STEP = -0.06
 CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
 
 GUST_TIME = 0.5          # s
@@ -157,143 +178,198 @@ SENSOR_NAMES = {
     "hitch_quat": "hitch_angle",
 }
 
-# ---------------- driver-model parameters ----------------
-# NOTE on driver realism (FIX #5): these six constants (WHEELBASE through
-# Y_DEADBAND) describe a preview-steering / reaction-delay / rate-limited
-# driver model, but control_function() below does NOT use any of them —
-# it's a plain instantaneous 2-state LQR. They're left here in case you
-# want to wire them in, but as written the controller has zero reaction
-# delay, no steering-rate limit, and no deadband. Don't describe results
-# from this controller as including those effects.
-WHEELBASE = 0.288        # m, car wheelbase (pure-pursuit geometry) — UNUSED
-LOOKAHEAD_TIME = 0.8     # s, how far down the road the driver looks — UNUSED
-LOOKAHEAD_MIN = 0.6      # m, minimum preview distance at low speed — UNUSED
-REACTION_DELAY = 0.25    # s, perception + neuromuscular delay — UNUSED
-STEER_RATE_MAX = 6.0     # rad/s max front-wheel rate (RC servo limit) — UNUSED
-Y_DEADBAND = 0.01        # m, offsets smaller than this are ignored — UNUSED
+WHEELBASE = 0.288        # m, car wheelbase
+CRUISE_SPEED = SPEED_CTRL * WHEEL_RADIUS   # m/s, design speed for the LQR
+
+# rad/s, how fast the steering servo can actually move (a digital RC servo
+# doing 60 deg in ~0.08 s). Keeps the commanded angle continuous; without
+# it the tire-load traces show a comb at LIDAR_SCAN_HZ and its harmonics
+# that is purely command discontinuity, not vehicle dynamics.
+STEER_RATE_MAX = 13.0
+# NOTE: apart from the servo rate limit, control_function() is an
+# instantaneous full-state LQR. No reaction delay, no deadband - don't
+# describe its results as including human-driver effects.
 
 
 # =====================================================================
 # >>> CONTROLLER — EDIT THIS FUNCTION <<<
-# (unchanged — never called in PIVOT_MODE)
+# (never called in PIVOT_MODE)
 # =====================================================================
-# original value: .8742, .5
 LQR_K = np.array([0.8742, 0.5])   # [y_error, heading_error] -> steering_angle
 # NOTE: this K was designed on a 2-state [lane offset, heading] model of the
 # CAR ONLY (BWSI racecar wall-following lab). It has no hitch/trailer term,
 # so it stabilizes the car's lane tracking but does NOT actively damp
 # trailer sway - it only helps indirectly, by keeping the tow vehicle's
 # path smoother and its steering less abrupt than the human-driver model.
-# If you want the controller to actually counter hitch oscillation, augment
-# the state with hitch angle (and ideally hitch rate) from sensors
-# ["hitch_quat"] and redesign K around a car+trailer model - see the
-# comment block below the function for a sketch of how to wire that in.
+# Kept here for A/B comparison against LQR_K_SWAY below.
+
+CONTROLLER_MODE = "sway"   # "lane" = original 2-state car-only LQR above
+                           # "sway" = full 6-state car+trailer LQR below
+
+# Full car+trailer LQR gain, x = [v1, r1, r2, theta, psi1, y]:
+#   v1    - car lateral velocity (body frame)           [m/s]
+#   r1    - car yaw rate                                [rad/s]
+#   r2    - trailer yaw rate                            [rad/s]
+#   theta - articulation angle, psi1 - psi2             [rad]
+#   psi1  - car heading error relative to the lane      [rad]
+#   y     - car lateral offset from lane center         [m]
+# steering_angle = -LQR_K_SWAY @ x
+#
+# Solved here rather than pasted in as a literal, so it always matches the
+# rig constants above. Designed at the *worst* loading the run sweep
+# reaches (the most rearward CARGO_OFFSET), because that is the only one
+# whose open loop is actually unstable and a gain designed on the neutral
+# loading does not stabilise it. See trailer_model.py.
+LQR_DESIGN_OFFSET = CARGO_OFFSET + (N_RUNS - 1) * CARGO_OFFSET_STEP
+
+
+def _design_params(cargo_offset, cargo_mass):
+    return trailer_model.rig_params(
+        cargo_offset, cargo_mass,
+        frame_mass=FRAME_MASS, frame_com_x=FRAME_COM_X,
+        wheel_mass=TRAILER_WHEEL_MASS, hitch_to_axle=HITCH_TO_AXLE)
+
+
+LQR_K_SWAY = trailer_model.design_lqr(
+    CRUISE_SPEED, _design_params(LQR_DESIGN_OFFSET, CARGO_MASS),
+    Q=np.diag([0.0, 0.0, 1.0, 300.0, 50.0, 25.0]), R=20.0)
 
 
 def get_wall_line(ranges, angles, start_idx, end_idx):
-    """Fits a line y = m*x + b to a slice of LiDAR ranges in local frame."""
+    """Fit a line y = m*x + b to a slice of a LiDAR scan, in the site frame.
+    Returns (slope, intercept), or None if too few rays hit anything."""
     r = ranges[start_idx:end_idx]
     a = angles[start_idx:end_idx]
-    
+
     # Filter out max-range/invalid hits
     valid = r < (LIDAR_MAX_RANGE - 0.5)
     if np.sum(valid) < 5:
         return None
-        
-    x = r[valid] * np.cos(a[valid])  # forward distance
-    y = r[valid] * np.sin(a[valid])  # lateral distance
-    
-    # Fit line: y = m*x + b (m = slope/heading, b = lateral offset at car position)
+
+    x = r[valid] * np.cos(a[valid])   # along the site's x axis
+    y = r[valid] * np.sin(a[valid])   # perpendicular to it
+
+    # m = wall angle relative to the car, b = perpendicular distance to it
     m, b = np.polyfit(x, y, 1)
     return m, b
 
+
 def get_heading_position_wall(ranges, angles):
-    """Returns heading error (rad) and lateral position offset (m) relative to track center."""
-    # Rays: 1080 total points across -135° to +135° (index 540 = 0° forward)
-    # Right side: -100° to -20° (indices ~140 to 460)
-    # Left side:   +20° to +100° (indices ~620 to 940)
+    """Car heading error (rad) and lane offset (m) from the two walls.
+
+    1080 rays spanning -135..+135 deg of the LiDAR site frame; index 540 is
+    the site's own +x. The site carries euler="0 0 180", so that direction
+    points AFT along the car and the two windows below actually straddle the
+    rear quarters. Both the x and the y axis flip with that 180 deg rotation,
+    which leaves the fitted slope unchanged and swaps the two walls, so the
+    "left"/"right" naming and both output signs still come out in the car's
+    own frame: +heading = nose toward +y, +offset = car left of center.
+    (Verified against ground truth over +-0.2 m and +-10 deg.)
+    """
+    # -100..-20 deg (indices 140..460) and +20..+100 deg (620..940). The
+    # +-20 deg gap around index 540 keeps the trailer out of the fit.
     right_line = get_wall_line(ranges, angles, 140, 460)
-    left_line  = get_wall_line(ranges, angles, 620, 940)
+    left_line = get_wall_line(ranges, angles, 620, 940)
 
     if right_line is None or left_line is None:
         return 0.0, 0.0  # Fallback if walls are lost
 
     m_right, b_right = right_line
-    m_left,  b_left  = left_line
+    m_left, b_left = left_line
 
     # Heading error is the average angle of the walls
     heading_error = math.atan((m_right + m_left) / 2.0)
 
     # Track center offset: average of left wall (+) and right wall (-) offsets
-    y_error = (b_left + b_right) / 2.0  
-    print("b: ", y_error, "m: ", -heading_error, "control signal: ", -float(LQR_K @ np.array([y_error, heading_error])))
+    y_error = (b_left + b_right) / 2.0
     return -heading_error, y_error
 
-def control_function(sensors, dt, state, model=None, data=None, site_id=None, car_id=None):
+
+def get_hitch_yaw(hitch_sensor):
+    """Articulation angle theta = psi1 - psi2 (car heading minus trailer
+    heading), radians. Reads the ball-joint quaternion in normal mode and
+    the hinge angle in PLANAR_MODE.
+
+    Both sensors report the trailer *relative to the car*, i.e. psi2 - psi1,
+    so the sign is flipped to match the state vector the LQR was designed
+    on (trailer_model.py, where theta_dot = r1 - r2).
+    """
+    if len(hitch_sensor) == 1:                     # jointpos, PLANAR_MODE
+        return -float(hitch_sensor[0])
+    hw, hx, hy, hz = hitch_sensor                  # ballquat
+    return -math.atan2(2 * (hw * hz + hx * hy), 1 - 2 * (hy * hy + hz * hz))
+
+
+# Leak time constant on the lateral-velocity integrator: long compared with
+# the ~1 s sway transient, short enough to bleed off accelerometer bias
+# instead of letting it drift over the whole MAX_RECORD window.
+V_EST_LEAK_TAU = 2.0  # s
+
+
+def control_function(sensors, dt, state, model, data, site_id, car_id):
     # 1. Initialize state variables on the first run
     if "step_count" not in state:
         state["step_count"] = 0
-        state["last_steer"] = 0.0
+        state["steer_target"] = 0.0   # newest LQR command
+        state["last_steer"] = 0.0     # what the servo has reached
         state["last_speed"] = SPEED_CTRL
-        
-        # Calculate how many 0.001s steps make up one 20Hz LiDAR scan (should be 50)
+        state["v_est"] = 0.0     # car lateral velocity estimate [m/s]
+        state["heading_err"] = 0.0
+        state["y_err"] = 0.0
+        state["scan"] = None     # newest (angles, ranges), for logging
+        # How many physics steps make up one LiDAR scan (50 at 20 Hz, 1 kHz)
         state["lidar_interval"] = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))
 
-    # 2. Only run the expensive LiDAR scan at 20Hz
+    # r1 (car yaw rate) and r2 (trailer yaw rate) are both directly measured
+    # every step - gyro z-component in each body's own frame.
+    r1 = float(sensors["car_gyro"][2])
+    r2 = float(sensors["trailer_gyro"][2])
+
+    # theta is directly measured every step too - this rig has a real hitch
+    # sensor, so no estimator is needed for it.
+    theta = get_hitch_yaw(sensors["hitch_quat"])
+
+    # v1 has no direct sensor, so integrate the car IMU's body-frame lateral
+    # accelerometer. That accelerometer measures specific force, which in a
+    # turn is v1_dot + V*r1, so the centripetal term has to be subtracted
+    # before integrating or the estimate just tracks yaw rate. The leak
+    # keeps residual bias from accumulating.
+    state["v_est"] += (float(sensors["car_accel"][1])
+                       - CRUISE_SPEED * r1) * dt
+    state["v_est"] *= (1.0 - dt / V_EST_LEAK_TAU)
+
+    # 2. Only the expensive LiDAR scan runs at LIDAR_SCAN_HZ. It is the sole
+    #    source of psi1 and y, so those two states are held between scans.
     if state["step_count"] % state["lidar_interval"] == 0:
-        if model is not None and data is not None:
-            # Get real-time LiDAR scan
-            angles, ranges = simulate_lidar(model, data, site_id, car_id)
-            # Extract errors from real LiDAR scan
-            heading_err, y_err = get_heading_position_wall(ranges, angles)
-            
-            # Print debugs here so they only print at 20Hz, not 1000Hz
-            left_avg = np.mean(ranges[160:200])
-            right_avg = np.mean(ranges[880:920])
-            # print(f"Controller -> left avg: {left_avg:.3f}, right avg: {right_avg:.3f}")
-        else:
-            # Fallback to IMU dead reckoning
-            print("dead reckoning fallback!!!!!")
-            w, x, y, z = sensors["car_quat"]
-            yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-            heading_err = (yaw + math.pi) % (2 * math.pi) - math.pi
-            
-            # Initialize v_est and y_est if falling back to IMU
-            if "v_est" not in state:
-                state["v_est"] = 0.0
-                state["y_est"] = 0.0
-                
-            state["v_est"] += float(sensors["car_accel"][0]) * dt
-            state["y_est"] += state["v_est"] * math.sin(yaw) * dt
-            y_err = state["y_est"]
+        angles, ranges = simulate_lidar(model, data, site_id, car_id)
+        state["scan"] = (angles, ranges)
+        state["heading_err"], state["y_err"] = get_heading_position_wall(
+            ranges, angles)
 
-        # 3. LQR Control step
-        x_err = np.array([y_err, heading_err])
+    # 3. Control law, recomputed every physics step. v1/r1/r2/theta come
+    #    from the IMUs and the hitch sensor at the full rate, so holding the
+    #    whole command at the LiDAR rate would throw away the fast states
+    #    the sway damping depends on - and the resulting stair-step command
+    #    costs enough phase margin to destabilise the rearmost loading.
+    if CONTROLLER_MODE == "sway":
+        x_state = np.array([state["v_est"], r1, r2, theta,
+                            state["heading_err"], state["y_err"]])
+        steering_angle = -float(LQR_K_SWAY @ x_state)
+    else:
+        x_err = np.array([state["y_err"], state["heading_err"]])
         steering_angle = -float(LQR_K @ x_err)
-        steer = max(-MAX_STEER, min(MAX_STEER, steering_angle))
-        
-        # Save the new steering command
-        state["last_steer"] = steer
 
-    # 4. Increment counter and return the held state
+    # +0.61 rad is full left, -0.61 rad full right, 0 straight
+    state["steer_target"] = max(-MAX_STEER, min(MAX_STEER, steering_angle))
+
+    # 4. Slew the servo toward the target at its real rate limit.
+    step = STEER_RATE_MAX * dt
+    error = state["steer_target"] - state["last_steer"]
+    state["last_steer"] += max(-step, min(step, error))
+
     state["step_count"] += 1
-    #print(f"steer: {state['last_steer']:.3f}, speed: {state['last_speed']:.3f}")
-    #.61 is all the way left, -.61 is all the way right, 0 is straight
     return state["last_steer"], state["last_speed"]
 
-# ---------------------------------------------------------------------
-# Sketch for adding sway damping on top of this (not wired in - you'd
-# need to design K3/K4 yourself, e.g. via LQR on a linearized car+trailer
-# bicycle-with-trailer model):
-#
-#   hw, hx, hy, hz = sensors["hitch_quat"]
-#   hitch_yaw = math.atan2(2*(hw*hz+hx*hy), 1-2*(hy*hy+hz*hz))
-#   hitch_rate = (hitch_yaw - state.get("prev_hitch_yaw", hitch_yaw)) / dt
-#   state["prev_hitch_yaw"] = hitch_yaw
-#   K_aug = np.array([0.8742, 0.5, K3, K4])   # you design K3, K4
-#   x_err = np.array([state["y_est"], heading_error, hitch_yaw, hitch_rate])
-#   steering_angle = -float(K_aug @ x_err)
-# ---------------------------------------------------------------------
 # =====================================================================
 # >>> END CONTROLLER <<<
 # =====================================================================
@@ -324,11 +400,19 @@ def trailer_xml(cargo_offset, cargo_mass):
               + cargo_mass * cx)
     axle_load = G * moment / ax
     tongue_load = G * total - axle_load
+    # the tongue hangs HITCH_H behind the car's rear axle, so a negative
+    # tongue load levers weight off that axle - and once it reaches zero
+    # the driven wheels leave the ground and the car is unrecoverable
+    rear_load = (trailer_model.CAR_MASS * G * trailer_model.CAR_A / WHEELBASE
+                 + tongue_load * (WHEELBASE + trailer_model.HITCH_H) / WHEELBASE)
     print(f"Axle at x = {ax:.3f} m | payload at x = {cx:.3f} m "
           f"({cargo_offset:+.3f} m from axle), {cargo_mass:.2f} kg")
     print(f"Static tongue load = {1000 * tongue_load / G:.0f} g "
           f"({100 * tongue_load / (G * total):.0f}% of trailer weight)"
           + ("  << NEGATIVE: sway-prone!" if tongue_load < 0 else ""))
+    print(f"Car rear axle load = {rear_load:.1f} N"
+          + ("  << REAR WHEELS LIFTING: no controller can recover this"
+             if rear_load <= 2.0 else ""))
     # ---- combined frame+cargo inertial (parallel-axis theorem) ----
     frame_com = np.array([FRAME_COM_X, 0.0, -0.045])
     frame_I = np.array([0.0035, 0.012, 0.014])
@@ -471,12 +555,11 @@ def build_model(cargo_offset, cargo_mass):
         # in the "tire" default class in the XML, so one replace covers all
         # four car tires (the trailer tires already got PLANAR_TIRE_MU
         # explicitly in trailer_xml)
-        # FIX #3: assert this actually matched instead of silently no-op'ing
-        # if the XML's default tire friction string ever changes.
-        assert 'friction="1.3 0.005 0.0001"' in xml, (
-            'default tire friction="1.3 0.005 0.0001" not found in XML — '
+        tire_friction = f'friction="{TRAILER_TIRE_MU} 0.005 0.0001"'
+        assert tire_friction in xml, (
+            f'default tire {tire_friction} not found in XML — '
             'PLANAR_TIRE_MU would silently NOT be applied to the car tires')
-        xml = xml.replace('friction="1.3 0.005 0.0001"',
+        xml = xml.replace(tire_friction,
                           f'friction="{PLANAR_TIRE_MU} 0.005 0.0001"')
         # NOTE: unlike the full-size model, the car COM is already centered
         # between the axles in the XML, so no inertial patch is needed here.
@@ -504,6 +587,9 @@ def read_sensors(model, data):
 def simulate_lidar(model, data, site_id, exclude_body_id,
                     fov_deg=LIDAR_FOV_DEG, pts_per_deg=LIDAR_PTS_PER_DEG,
                     max_range=LIDAR_MAX_RANGE):
+    """Horizontal fan of rays from the lidar site. Angles are in the site
+    frame; the site carries euler="0 0 180" in the XML, so angle 0 points
+    aft along the car. Returns (angles [rad], ranges [m])."""
     n_rays = int(fov_deg * pts_per_deg)
     angles = np.linspace(-fov_deg / 2, fov_deg / 2, n_rays) * np.pi / 180
 
@@ -518,6 +604,9 @@ def simulate_lidar(model, data, site_id, exclude_body_id,
                               None, 1, exclude_body_id, geomid)
         if dist >= 0:
             ranges[i] = min(dist, max_range)
+    if LIDAR_RANGE_ACCURACY:
+        hit = ranges < max_range
+        ranges[hit] += np.random.normal(0.0, LIDAR_RANGE_ACCURACY, hit.sum())
     return angles, ranges
 
 def tire_normal_loads(model, data, tire_ids, floor_id):
@@ -545,6 +634,15 @@ def mode_tag():
     return tag
 
 
+def next_free_path(template):
+    """First path of the form template.format(simNum=n) that doesn't exist,
+    so repeated runs of the same configuration don't overwrite each other."""
+    n = 1
+    while os.path.exists(template.format(simNum=n)):
+        n += 1
+    return template.format(simNum=n)
+
+
 def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     model = build_model(cargo_offset, cargo_mass)
     # fix the clipping making it impossible to view
@@ -552,10 +650,9 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     model.vis.map.znear = 0.01
     data = mujoco.MjData(model)
 
-    dl = model.actuator("drive_left").id
-    dr = model.actuator("drive_right").id
-    dlf = model.actuator("drive_left_front").id
-    drf = model.actuator("drive_right_front").id
+    drive_ids = [model.actuator(n).id for n in
+                 ("drive_left", "drive_right",
+                  "drive_left_front", "drive_right_front")]
     sl = model.actuator("steer_left").id
     sr = model.actuator("steer_right").id
     trailer_id = model.body("trailer").id
@@ -564,14 +661,14 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
     hitch_is_ball = int(hitch_joint.type[0]) == mujoco.mjtJoint.mjJNT_BALL
     hf_adr = model.sensor("hitch_force").adr[0]
     dt = model.opt.timestep
-    LIDAR_SAVE_EVERY  = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))  # ~50 steps at 20 Hz, dt=0.001
+    lidar_save_every = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))  # 50 steps at 20 Hz, dt=1 ms
     trailer_rear_x = DECK_X_MIN            # gust acts on the trailer tail
 
     pv = None
     if PIVOT_MODE:
         pv = model.actuator("leader_drive").id
         # freewheel the drive wheels: the tow point pulls, not the wheels
-        for a in (dl, dr, dlf, drf):
+        for a in drive_ids:
             model.actuator_gainprm[a, 0] = 0
             model.actuator_biasprm[a, 2] = 0
 
@@ -594,18 +691,11 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                 + [("record", int(MAX_RECORD / dt))])
 
     os.makedirs("csvs", exist_ok=True)
-    simNum = 1
-    while os.path.exists(f"csvs/RC_Sway_{mode_tag()}_{DISTURBANCE}_run{run_idx + 1}"
-            f"_mag{magnitude:g}_v{SPEED_CTRL:.0f}"
-            f"_cargo{cargo_mass:g}kg_off{cargo_offset:+.3f}"
-            f"_mu{TRAILER_TIRE_MU}_simNum{simNum}.csv"):
-        simNum += 1
-    csv_filename = (
+    csv_filename = next_free_path(
         f"csvs/RC_Sway_{mode_tag()}_{DISTURBANCE}_run{run_idx + 1}"
         f"_mag{magnitude:g}_v{SPEED_CTRL:.0f}"
         f"_cargo{cargo_mass:g}kg_off{cargo_offset:+.3f}"
-        f"_mu{TRAILER_TIRE_MU}_simNum{simNum}.csv"
-    )
+        f"_mu{TRAILER_TIRE_MU}_simNum{{simNum}}.csv")
     headers = ["time", "hitch_yaw_deg", "hitch_lat_force", "trailer_y",
                "car_yaw_deg", "car_roll_deg", "car_y", "tl_grip", "tr_grip",
                "fl_grip", "fr_grip", "rl_grip", "rr_grip", "front_weight",
@@ -629,13 +719,6 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
             while viewer.is_running() and phase_idx < len(schedule):
                 step_start = time.time()
                 phase = schedule[phase_idx][0]
-                # --- ADDED: Print LiDAR during pre-record phases ---
-                if phase in ["settle", "spinup"] and step_in_phase % 500 == 0:
-                    angles, ranges = simulate_lidar(model, data, lidar_site_id, car_body_id)
-                    left_avg = np.mean(ranges[160:200])
-                    right_avg = np.mean(ranges[880:920])
-                    print(f"[{phase.upper()} Phase] left average: {left_avg:.3f}, right average: {right_avg:.3f}")
-                # ---------------------------------------------------
 
                 if PIVOT_MODE:
                     # controller OFF; the tow point pulls the car forward,
@@ -648,40 +731,26 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     data.ctrl[sr] = steer
                 elif phase == "record":
                     # ---- your controller drives steering AND speed ----
-                    # FIX #1: dl/dr were previously fed `steer` (a leftover
-                    # from an edit — see original's "# was speed" comments).
-                    # All four drive actuators now correctly get `speed`,
-                    # matching the non-controller "drive" phase below.
-                    # FIX #4: removed the redundant second steer-clamp here
-                    # (control_function already clamps to MAX_STEER).
                     steer, speed = control_function(
-                        read_sensors(model, data), 
-                        dt, 
-                        ctrl_state, 
-                        model=model, 
-                        data=data, 
-                        site_id=lidar_site_id, 
-                        car_id=car_body_id)
+                        read_sensors(model, data), dt, ctrl_state,
+                        model=model, data=data,
+                        site_id=lidar_site_id, car_id=car_body_id)
                     speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer
-                    data.ctrl[dl] = speed
-                    data.ctrl[dr] = speed
-                    data.ctrl[dlf] = speed
-                    data.ctrl[drf] = speed
+                    for a in drive_ids:
+                        data.ctrl[a] = speed
                 else:
                     if phase == "spinup":
                         ramp = min(1.0, step_in_phase / schedule[phase_idx][1])
                         target = ramp * SPEED_CTRL
-                        data.ctrl[dl] = target
-                        data.ctrl[dr] = target
-                        data.ctrl[dlf] = target
-                        data.ctrl[drf] = target
-                    elif phase != "settle":
-                        data.ctrl[dl] = SPEED_CTRL
-                        data.ctrl[dr] = SPEED_CTRL
-                        data.ctrl[dlf] = SPEED_CTRL
-                        data.ctrl[drf] = SPEED_CTRL
+                    elif phase == "settle":
+                        target = None
+                    else:
+                        target = SPEED_CTRL
+                    if target is not None:
+                        for a in drive_ids:
+                            data.ctrl[a] = target
                     steer = {"swerve_r": magnitude,
                              "swerve_l": -magnitude}.get(phase, 0.0)
                     data.ctrl[sl] = steer
@@ -700,10 +769,12 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
 
                 mujoco.mj_step(model, data)
 
-                if SIMULATE_LIDAR and phase == "record" and step_in_phase % LIDAR_SAVE_EVERY == 0:
-                    angles, ranges = simulate_lidar(model, data, lidar_site_id, car_body_id)
-                    lidar_scans.append((data.time, ranges))
-
+                # log the scan the controller just used, rather than firing
+                # another 1080 rays for the same instant
+                if (SIMULATE_LIDAR and phase == "record"
+                        and step_in_phase % lidar_save_every == 0
+                        and ctrl_state.get("scan") is not None):
+                    lidar_scans.append((data.time, ctrl_state["scan"][1]))
 
                 if phase not in ("settle", "spinup"):
                     if hitch_is_ball:
@@ -880,12 +951,9 @@ def plot_results(runs):
                 a.axvspan(s, e, color="red", alpha=0.3, lw=0)
 
         fig.tight_layout()
-        simNum = 1
-        while os.path.exists(f"plots/run{i + 1}_{tag}_{DISTURBANCE}"
-                              f"_mag{r['magnitude']:g}_speed{r['speed_ctrl']:g}_simNum{simNum}.png"):
-            simNum += 1
-        out = (f"plots/run{i + 1}_{tag}_{DISTURBANCE}"
-               f"_mag{r['magnitude']:g}_speed{r['speed_ctrl']:g}_simNum{simNum}.png")
+        out = next_free_path(
+            f"plots/run{i + 1}_{tag}_{DISTURBANCE}_mag{r['magnitude']:g}"
+            f"_speed{r['speed_ctrl']:g}_simNum{{simNum}}.png")
         fig.savefig(out, dpi=120)
         print(f"Plot saved at {out}")
     plt.show()
