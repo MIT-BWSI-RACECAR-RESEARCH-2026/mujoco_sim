@@ -129,7 +129,7 @@ CARGO_MASS_STEP = 0.0    # kg added to CARGO_MASS after every run
 GUST_TIME = 0.5          # s
 SETTLE_TIME = 1.0        # s
 SPINUP_TIME = 5.0        # s
-MAX_RECORD = 15.0        # s
+MAX_RECORD = 30.0        # s
 REALTIME = True
 # ---------------------------------------------------
 
@@ -151,8 +151,13 @@ HITCH_LIMIT_DEG = 45.0   # hitch joint range from the XML
 HITCH_HIT_MARGIN = 1.0   # deg, within this of the limit counts as contact
 FLIP_ROLL_DEG = 60.0     # deg of car roll that counts as flipped sideways
 
+# ------------------------MODE SETTINGS---------------------------
+PD_WALL_FOLLOW_MODE = True  # True: PD wall following controller, False: LQR controller
+PIVOT_MODE = False        # True: controller OFF, car towed by a tow point. OVERRIDES PD MODE AND LQR MODE
+PLANAR_MODE = False      # True: no vertical-axis motion at all. No fore/aft
+
+
 # ---------------- pivot (towed oscillation) mode ----------------
-PIVOT_MODE = False        # True: controller OFF, car towed by a tow point
 TOW_EYE = (0.1439, 0.0, -0.0076)   # car frame: center of the front axle
 CAR_Z0 = 0.0531          # car body height at qpos0 (from the XML)
 PIVOT_SPEED = SPEED_CTRL * WHEEL_RADIUS   # m/s tow speed (customizable)
@@ -160,7 +165,6 @@ PIVOT_SPRING_K = 25.0    # N/m, lateral spring pulling the tow point to y=0
 PIVOT_SPRING_C = 8.0     # N*s/m, lateral damping on the tow point
 
 # ---------------- planar / no-weight-shift mode ----------------
-PLANAR_MODE = False      # True: no vertical-axis motion at all. No fore/aft
                          # or side-to-side weight shift, constant normal
                          # forces, same friction coefficient on every tire.
 PLANAR_TIRE_MU = 1.0     # friction coefficient applied to ALL six tires
@@ -191,11 +195,13 @@ STEER_RATE_MAX = 13.0
 # describe its results as including human-driver effects.
 
 
-# =====================================================================
-# >>> CONTROLLER — EDIT THIS FUNCTION <<<
-# (never called in PIVOT_MODE)
-# =====================================================================
+#GAINS
+# lqr gains
 LQR_K = np.array([0.8742, 0.5])   # [y_error, heading_error] -> steering_angle
+#standard wall following gains
+PD_KP = 1.2
+PD_KD = 0.2
+
 # NOTE: this K was designed on a 2-state [lane offset, heading] model of the
 # CAR ONLY (BWSI racecar wall-following lab). It has no hitch/trailer term,
 # so it stabilizes the car's lane tracking but does NOT actively damp
@@ -369,6 +375,59 @@ def control_function(sensors, dt, state, model, data, site_id, car_id):
 
     state["step_count"] += 1
     return state["last_steer"], state["last_speed"]
+
+
+def pd_control_function(sensors, dt, state, model, data, site_id, car_id):
+    # 1. Initialize state variables on the first run
+    if "step_count" not in state:
+        state["step_count"] = 0
+        state["steer_target"] = 0.0   # newest command
+        state["last_steer"] = 0.0     # what the servo has reached
+        state["last_speed"] = SPEED_CTRL
+        state["heading_err"] = 0.0
+        state["y_err"] = 0.0
+        state["last_y_err"] = 0.0     # Added to track previous error for the derivative
+        state["scan"] = None          # newest (angles, ranges), for logging
+        
+        # How many physics steps make up one LiDAR scan (50 at 20 Hz, 1 kHz)
+        state["lidar_interval"] = max(1, round(1 / (LIDAR_SCAN_HZ * dt)))
+
+    # 2. Update LIDAR at the specified frequency
+    if state["step_count"] % state["lidar_interval"] == 0:
+        angles, ranges = simulate_lidar(model, data, site_id, car_id)
+        state["scan"] = (angles, ranges)
+        
+        # Save previous error for the derivative term
+        state["last_y_err"] = state["y_err"]
+        
+        # Extract the new lateral offset (y_err) and heading error from the walls
+        state["heading_err"], state["y_err"] = get_heading_position_wall(ranges, angles)
+
+    # 3. Control law, recomputed every physics step.
+    # We calculate the derivative using the time elapsed between LIDAR updates.
+    pd_dt = state["lidar_interval"] * dt
+    
+    # Calculate the rate of change of the error (derivative)
+    derivative = (state["y_err"] - state["last_y_err"]) / pd_dt
+    
+    # Apply the PD formula
+    # A positive y_err means the car is left of center, requiring a negative steering angle (right).
+    steering_angle = -(PD_KP * state["y_err"] + PD_KD * derivative)
+
+    # Cap the steering angle to the physical limits of the vehicle (+/- 0.61 rad)
+    state["steer_target"] = max(-MAX_STEER, min(MAX_STEER, steering_angle))
+
+    # 4. Slew the servo toward the target at its real rate limit.
+    step = STEER_RATE_MAX * dt
+    error = state["steer_target"] - state["last_steer"]
+    state["last_steer"] += max(-step, min(step, error))
+
+    state["step_count"] += 1
+    return state["last_steer"], state["last_speed"]
+
+# =====================================================================
+# >>> END CONTROLLER <<<
+# =====================================================================
 
 # =====================================================================
 # >>> END CONTROLLER <<<
@@ -731,10 +790,16 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                     data.ctrl[sr] = steer
                 elif phase == "record":
                     # ---- your controller drives steering AND speed ----
-                    steer, speed = control_function(
+                    if PD_WALL_FOLLOW_MODE:
+                        steer, speed = pd_control_function(
                         read_sensors(model, data), dt, ctrl_state,
                         model=model, data=data,
                         site_id=lidar_site_id, car_id=car_body_id)
+                    else:
+                        steer, speed = control_function(
+                            read_sensors(model, data), dt, ctrl_state,
+                            model=model, data=data,
+                            site_id=lidar_site_id, car_id=car_body_id)
                     speed = max(0.0, min(300.0, speed))
                     data.ctrl[sl] = steer
                     data.ctrl[sr] = steer
