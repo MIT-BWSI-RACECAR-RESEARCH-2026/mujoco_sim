@@ -1,9 +1,8 @@
 csvs/
 plots/
 .vscode/
-
-# per-run outputs and scratch
 lidar/
+# per-run outputs and scratch
 plots_output/
 MUJOCO_LOG.TXT
 

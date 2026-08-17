@@ -924,7 +924,9 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
         os.makedirs("lidar", exist_ok=True)
         times = np.array([s[0] for s in lidar_scans])
         scans = np.array([s[1] for s in lidar_scans])
-        np.savez(f"lidar/run{run_idx + 1}_{mode_tag()}_scans.npz",
+        path = next_free_path(
+            f"lidar/run{run_idx + 1}_{mode_tag()}_scans_simNum{{simNum}}.npz")
+        np.savez(path,
                 times=times, scans=scans, fov_deg=LIDAR_FOV_DEG,
                 pts_per_deg=LIDAR_PTS_PER_DEG)
         print(f"Lidar scans saved: {scans.shape[0]} scans, {scans.shape[1]} rays each")
