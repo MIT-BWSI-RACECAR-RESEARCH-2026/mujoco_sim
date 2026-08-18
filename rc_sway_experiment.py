@@ -70,6 +70,7 @@ import matplotlib.pyplot as plt
 import mujoco
 import mujoco.viewer
 import numpy as np
+from scipy.signal import find_peaks
 
 import trailer_model
 
@@ -111,7 +112,7 @@ WIND = (0.0, 0.0, 0.0)   # m/s ambient wind, world frame. e.g. (0, -2, 0) is
 # grip-limited steer angle is 0.159 rad; at the old 160 rad/s (7.28 m/s) it
 # was 0.048 rad, so the 0.15 rad swerve below demanded 2.8 g and spun the
 # car into the wall before the controller ever engaged.
-SPEED_CTRL = 59.0        # 59 (2.68 m/s) causes swerving
+SPEED_CTRL = 65.0        # 59 (2.68 m/s) causes swerving
 DISTURBANCE = "swerve"   # "swerve" or "gust"
 
 N_RUNS = 3               # how many simulations to run
@@ -930,8 +931,36 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                 times=times, scans=scans, fov_deg=LIDAR_FOV_DEG,
                 pts_per_deg=LIDAR_PTS_PER_DEG)
         print(f"Lidar scans saved: {scans.shape[0]} scans, {scans.shape[1]} rays each")
+    #------------------------- stats calculation --------------------------
+    #calculate settling time
+    times = np.array(log["time"])
+    sway_angles = np.array(log["hitch_yaw_deg"])
+    max_sway = np.max(np.abs(sway_angles))
+    threshold = .05*max_sway
+    out_of_bounds = np.where(np.abs(sway_angles) > threshold)[0]
+    if len(out_of_bounds) > 0:
+        last_idx = out_of_bounds[-1]
+        settling_time = times[last_idx]-times[0]
+    else:
+        settling_time = 0.0
+    # calculate ise
+    ise = np.trapezoid(sway_angles**2, times)
+    # calculate logarithmic decrement
+    peaks, _ = find_peaks(np.abs(sway_angles))
+    if len(peaks) >= 2:
+        peak_1 = np.abs(sway_angles[peaks[0]])
+        peak_2 = np.abs(sway_angles[peaks[1]])
+        log_decrement = np.log(peak_1 / peak_2)
+    else:
+        log_decrement = 0.0
 
-
+    # print stats
+    print("\n=== LQR Sway Suppression Metrics ===")
+    print(f"Max Sway Amplitude:  {max_sway:.4f} rad")
+    print(f"5% Settling Time:    {settling_time:.3f} sec")
+    print(f"Log Decrement (δ):   {log_decrement:.4f}")
+    print(f"ISE:                 {ise:.4f}")
+    print("====================================\n")
     return log
 
 
