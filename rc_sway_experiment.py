@@ -932,35 +932,52 @@ def run_simulation(magnitude, cargo_offset, cargo_mass, run_idx):
                 pts_per_deg=LIDAR_PTS_PER_DEG)
         print(f"Lidar scans saved: {scans.shape[0]} scans, {scans.shape[1]} rays each")
     #------------------------- stats calculation --------------------------
-    #calculate settling time
-    times = np.array(log["time"])
-    sway_angles = np.array(log["hitch_yaw_deg"])
-    max_sway = np.max(np.abs(sway_angles))
-    threshold = .05*max_sway
-    out_of_bounds = np.where(np.abs(sway_angles) > threshold)[0]
-    if len(out_of_bounds) > 0:
-        last_idx = out_of_bounds[-1]
-        settling_time = times[last_idx]-times[0]
-    else:
-        settling_time = 0.0
-    # calculate ise
-    ise = np.trapezoid(sway_angles**2, times)
-    # calculate logarithmic decrement
-    peaks, _ = find_peaks(np.abs(sway_angles))
-    if len(peaks) >= 2:
-        peak_1 = np.abs(sway_angles[peaks[0]])
-        peak_2 = np.abs(sway_angles[peaks[1]])
-        log_decrement = np.log(peak_1 / peak_2)
-    else:
-        log_decrement = 0.0
+    if not PD_WALL_FOLLOW_MODE:
+        #calculate settling time
+        times = np.array(log["time"])
+        sway_angles = np.array(log["hitch_yaw_deg"])
+        max_sway = np.max(np.abs(sway_angles))
+        threshold = .05*max_sway
+        out_of_bounds = np.where(np.abs(sway_angles) > threshold)[0]
+        if len(out_of_bounds) > 0:
+            last_idx = out_of_bounds[-1]
+            settling_time = times[last_idx]-times[0]
+        else:
+            settling_time = 0.0
+        # calculate ise
+        ise = np.trapezoid(sway_angles**2, times)
+        # calculate logarithmic decrement
+        
+        peaks, _ = find_peaks(np.abs(sway_angles))
 
-    # print stats
-    print("\n=== LQR Sway Suppression Metrics ===")
-    print(f"Max Sway Amplitude:  {max_sway:.4f} rad")
-    print(f"5% Settling Time:    {settling_time:.3f} sec")
-    print(f"Log Decrement (δ):   {log_decrement:.4f}")
-    print(f"ISE:                 {ise:.4f}")
-    print("====================================\n")
+        if len(peaks) >= 2:
+            peak_1 = np.abs(sway_angles[peaks[-1]])
+            peak_2 = np.abs(sway_angles[peaks[-2]])
+            log_decrement = np.log(peak_1 / peak_2)
+        else:
+            log_decrement = 0.0
+
+        # print stats
+        print("\n=== LQR Sway Suppression Metrics ===")
+        print(f"Max Sway Amplitude:  {max_sway:.4f} deg")
+        print(f"5% Settling Time:    {settling_time:.3f} sec")
+        print(f"Log Decrement (δ):   {log_decrement:.4f}")
+        print(f"ISE:                 {ise:.4f}")
+        print("====================================\n")
+    else:
+        times = np.array(log["time"])
+        sway_angles = np.array(log["hitch_yaw_deg"])
+        max_sway = np.max(np.abs(sway_angles))
+        peaks, _ = find_peaks(np.abs(sway_angles))
+        amplitudes = sway_angles[peaks]
+        average_amplitudes = np.mean(np.abs(amplitudes))
+        ise = np.trapezoid(sway_angles**2, times)
+
+        print("\n=== PD Mode Sway Metrics ===")
+        print(f"Max Sway Amplitude:  {max_sway:.4f} deg")
+        print(f"Average Sway:        {average_amplitudes:.4f} deg")
+        print(f"ISE:                 {ise:.4f}")
+        print("====================================\n")
     return log
 
 
